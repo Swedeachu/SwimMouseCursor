@@ -1,7 +1,7 @@
-// Standalone console utility to confine mouse to the Minecraft Bedrock fullscreen window.
+// Standalone console utility to confine mouse to the Minecraft Bedrock window.
 // Notes:
-//  - Detects Bedrock by process name "Minecraft.Windows.exe" (UWP). Falls back to window title contains "Minecraft".
-//  - Clips only when the window exactly covers its monitor (true fullscreen).
+//  - Detects Bedrock by process name "Minecraft.Windows.exe". Falls back to window title contains "Minecraft".
+//  - Clips cursor to window bounds whenever Minecraft is focused (fullscreen OR windowed)
 //  - Configurable hotkey to recenter cursor (default: E key, configurable via config.txt)
 //  - Uses low-level keyboard hook to NOT consume the key press
 
@@ -24,8 +24,8 @@ static const wchar_t* TARGET_EXE = L"Minecraft.Windows.exe";
 static const wchar_t* CONFIG_FILE = L"config.txt";
 static std::atomic<bool> clippingEnabled{ true };
 static std::atomic<bool> running{ true };
-static WORD g_recenterKey = 'E'; // Default recenter key
-static HHOOK g_keyboardHook = nullptr;
+static WORD recenterKey = 'E'; // Default recenter key
+static HHOOK keyboardHook = nullptr;
 
 static void Log(const wchar_t* fmt, ...)
 {
@@ -85,64 +85,34 @@ static bool IsMinecraftWindow(HWND hwnd)
 	return wcsstr(title, L"Minecraft") != nullptr;
 }
 
-static bool IsFullscreenOnAMonitor(HWND hwnd, RECT& outClipRect)
+static bool GetWindowClipRect(HWND hwnd, RECT& outClipRect)
 {
 	if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) return false;
 
 	RECT wr{};
 	if (!GetWindowRect(hwnd, &wr)) return false;
 
-	HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-	if (!mon) return false;
-
-	MONITORINFO mi{};
-	mi.cbSize = sizeof(mi);
-	if (!GetMonitorInfoW(mon, &mi)) return false;
-
-	RECT mr = mi.rcMonitor;
-
-	// DEBUG: Log the actual values to diagnose issues
-	static bool loggedOnce = false;
-	if (!loggedOnce)
+	// Clip to the window's client area for better experience
+	RECT clientRect{};
+	if (GetClientRect(hwnd, &clientRect))
 	{
-		Log(L"[DBG] Window: (%ld,%ld)-(%ld,%ld) [%ldx%ld]",
-			wr.left, wr.top, wr.right, wr.bottom,
-			wr.right - wr.left, wr.bottom - wr.top);
-		Log(L"[DBG] Monitor: (%ld,%ld)-(%ld,%ld) [%ldx%ld]",
-			mr.left, mr.top, mr.right, mr.bottom,
-			mr.right - mr.left, mr.bottom - mr.top);
-		loggedOnce = true;
+		POINT topLeft = { clientRect.left, clientRect.top };
+		POINT bottomRight = { clientRect.right, clientRect.bottom };
+
+		// Convert client coordinates to screen coordinates
+		if (ClientToScreen(hwnd, &topLeft) && ClientToScreen(hwnd, &bottomRight))
+		{
+			outClipRect.left = topLeft.x;
+			outClipRect.top = topLeft.y;
+			outClipRect.right = bottomRight.x;
+			outClipRect.bottom = bottomRight.y;
+			return true;
+		}
 	}
 
-	// More lenient tolerance for borderless fullscreen (handles DPI scaling, borders, etc.)
-	auto nearEq = [](int a, int b) { return abs(a - b) <= 8; };
-	bool covers =
-		nearEq(wr.left, mr.left) &&
-		nearEq(wr.top, mr.top) &&
-		nearEq(wr.right, mr.right) &&
-		nearEq(wr.bottom, mr.bottom);
-
-	if (covers)
-	{
-		outClipRect = mr; // use monitor bounds (not work area)
-		return true;
-	}
-
-	// Alternative: Check if window covers most of the monitor (90%+ area)
-	// This handles borderless fullscreen even better
-	int wWidth = wr.right - wr.left;
-	int wHeight = wr.bottom - wr.top;
-	int mWidth = mr.right - mr.left;
-	int mHeight = mr.bottom - mr.top;
-
-	float areaCoverage = (float)(wWidth * wHeight) / (float)(mWidth * mHeight);
-	if (areaCoverage >= 0.90f) // 90% or more coverage = treat as fullscreen
-	{
-		outClipRect = mr;
-		return true;
-	}
-
-	return false;
+	// Fallback to window rect if client rect fails
+	outClipRect = wr;
+	return true;
 }
 
 static void RecenterCursor(HWND hwnd)
@@ -153,7 +123,6 @@ static void RecenterCursor(HWND hwnd)
 		int centerX = (wr.left + wr.right) / 2;
 		int centerY = (wr.top + wr.bottom) / 2;
 		SetCursorPos(centerX, centerY);
-		// Log(L"[*] Cursor recentered to (%d, %d)", centerX, centerY); // this was way too spammy
 	}
 }
 
@@ -229,7 +198,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 			if (fg && IsMinecraftWindow(fg))
 			{
 				// Check if it's the recenter key OR escape key
-				if (kb->vkCode == g_recenterKey || kb->vkCode == VK_ESCAPE)
+				if (kb->vkCode == recenterKey || kb->vkCode == VK_ESCAPE)
 				{
 					RecenterCursor(fg);
 				}
@@ -238,7 +207,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 	}
 
 	// IMPORTANT: Return CallNextHookEx to NOT consume the key
-	return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+	return CallNextHookEx(keyboardHook, nCode, wParam, lParam);
 }
 
 static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType)
@@ -267,7 +236,7 @@ int wmain(int argc, wchar_t** argv)
 	Log(L"\n");
 
 	// Load recenter key from config
-	g_recenterKey = LoadRecenterKeyFromConfig();
+	recenterKey = LoadRecenterKeyFromConfig();
 
 	// Safety hotkey: Ctrl+Shift+C (this one can consume the key since it's a special combo)
 	if (!RegisterHotKey(nullptr, 1, MOD_CONTROL | MOD_SHIFT, 'C'))
@@ -280,18 +249,18 @@ int wmain(int argc, wchar_t** argv)
 	}
 
 	// Install low-level keyboard hook for recenter key (non-blocking)
-	g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(nullptr), 0);
-	if (!g_keyboardHook)
+	keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(nullptr), 0);
+	if (!keyboardHook)
 	{
 		Log(L"[!] Failed to install keyboard hook (error %lu).", GetLastError());
 	}
 	else
 	{
-		Log(L"[*] Recenter hotkey ready: Press '%c' to recenter cursor (non-blocking).", (char)g_recenterKey);
+		Log(L"[*] Recenter hotkey ready: Press '%c' to recenter cursor (non-blocking).", (char)recenterKey);
 	}
 
 	Log(L"[*] CursorClipperConsole running. Looking for: %s", TARGET_EXE);
-	Log(L"[*] Will clip ONLY when the game is truly fullscreen on a monitor.");
+	Log(L"[*] Will clip cursor whenever Minecraft window is focused (fullscreen OR windowed).");
 	Log(L"[*] Clipping is currently: ENABLED");
 
 	// We'll pump messages only for hotkey; foreground tracking is via polling.
@@ -321,7 +290,7 @@ int wmain(int argc, wchar_t** argv)
 					}
 					else
 					{
-						Log(L"[=] Clipping ENABLED — will clip when fullscreen.");
+						Log(L"[=] Clipping ENABLED — will clip when Minecraft is focused.");
 					}
 				}
 			}
@@ -370,24 +339,15 @@ int wmain(int argc, wchar_t** argv)
 			if (fg && IsMinecraftWindow(fg))
 			{
 				RECT clip{};
-				if (IsFullscreenOnAMonitor(fg, clip))
+				if (GetWindowClipRect(fg, clip))
 				{
 					if (!lastClipped)
 					{
-						Log(L"[#] Entered fullscreen — clipping to monitor (%ld,%ld)-(%ld,%ld).",
+						Log(L"[#] Clipping cursor to Minecraft window (%ld,%ld)-(%ld,%ld).",
 							clip.left, clip.top, clip.right, clip.bottom);
 					}
 					ClipCursor(&clip);
 					lastClipped = true;
-				}
-				else
-				{
-					if (lastClipped)
-					{
-						Log(L"[#] Not fullscreen anymore — releasing cursor.");
-						ClipCursor(nullptr);
-						lastClipped = false;
-					}
 				}
 			}
 			else
@@ -405,9 +365,9 @@ int wmain(int argc, wchar_t** argv)
 	}
 
 	// Cleanup
-	if (g_keyboardHook)
+	if (keyboardHook)
 	{
-		UnhookWindowsHookEx(g_keyboardHook);
+		UnhookWindowsHookEx(keyboardHook);
 	}
 
 	ClipCursor(nullptr);
