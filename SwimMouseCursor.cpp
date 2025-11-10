@@ -85,6 +85,86 @@ static bool IsMinecraftWindow(HWND hwnd)
 	return wcsstr(title, L"Minecraft") != nullptr;
 }
 
+static bool IsWindowActuallyVisibleAndTopmost(HWND hwnd)
+{
+	if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd))
+		return false;
+
+	// Check if the window is minimized
+	if (IsIconic(hwnd))
+		return false;
+
+	// CRITICAL: Window must be the actual foreground window receiving input
+	HWND fgWindow = GetForegroundWindow();
+	if (fgWindow != hwnd)
+		return false;
+
+	// Get the window rect
+	RECT windowRect{};
+	if (!GetWindowRect(hwnd, &windowRect))
+		return false;
+
+	// Check if window has any visible area
+	if (windowRect.right <= windowRect.left || windowRect.bottom <= windowRect.top)
+		return false;
+
+	// Additional check: Get the GUI thread info to verify focus
+	GUITHREADINFO gti = { sizeof(GUITHREADINFO) };
+	DWORD windowThreadId = GetWindowThreadProcessId(hwnd, nullptr);
+	if (GetGUIThreadInfo(windowThreadId, &gti))
+	{
+		// If there's an active window in the thread, it should match our window
+		if (gti.hwndActive && gti.hwndActive != hwnd)
+		{
+			// Check if active window belongs to same root
+			HWND activeRoot = GetAncestor(gti.hwndActive, GA_ROOT);
+			HWND ourRoot = GetAncestor(hwnd, GA_ROOT);
+			if (activeRoot != ourRoot)
+				return false;
+		}
+	}
+
+	// Sample multiple points across the window to ensure it's actually visible
+	// This catches cases where another window is layered on top
+	int numChecks = 0;
+	int passedChecks = 0;
+
+	for (int x = windowRect.left + 10; x < windowRect.right - 10; x += (windowRect.right - windowRect.left) / 4)
+	{
+		for (int y = windowRect.top + 10; y < windowRect.bottom - 10; y += (windowRect.bottom - windowRect.top) / 4)
+		{
+			numChecks++;
+			POINT pt = { x, y };
+			HWND windowAtPoint = WindowFromPoint(pt);
+
+			if (windowAtPoint)
+			{
+				HWND rootAtPoint = GetAncestor(windowAtPoint, GA_ROOT);
+				HWND rootMinecraft = GetAncestor(hwnd, GA_ROOT);
+
+				if (rootAtPoint == rootMinecraft)
+					passedChecks++;
+			}
+		}
+	}
+
+	// At least 75% of sampled points must belong to Minecraft
+	if (numChecks > 0 && passedChecks < (numChecks * 3 / 4))
+		return false;
+
+	// Final check: Verify no other window has captured input
+	HWND captureWindow = GetCapture();
+	if (captureWindow && captureWindow != hwnd)
+	{
+		HWND captureRoot = GetAncestor(captureWindow, GA_ROOT);
+		HWND ourRoot = GetAncestor(hwnd, GA_ROOT);
+		if (captureRoot != ourRoot)
+			return false;
+	}
+
+	return true;
+}
+
 static bool GetWindowClipRect(HWND hwnd, RECT& outClipRect)
 {
 	if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) return false;
@@ -194,8 +274,8 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 		{
 			HWND fg = GetForegroundWindow();
 
-			// Check if Minecraft is focused
-			if (fg && IsMinecraftWindow(fg))
+			// Check if Minecraft is focused AND actually visible
+			if (fg && IsMinecraftWindow(fg) && IsWindowActuallyVisibleAndTopmost(fg))
 			{
 				// Check if it's the recenter key OR escape key
 				if (kb->vkCode == recenterKey || kb->vkCode == VK_ESCAPE)
@@ -260,7 +340,7 @@ int wmain(int argc, wchar_t** argv)
 	}
 
 	Log(L"[*] CursorClipperConsole running. Looking for: %s", TARGET_EXE);
-	Log(L"[*] Will clip cursor whenever Minecraft window is focused (fullscreen OR windowed).");
+	Log(L"[*] Will clip cursor whenever Minecraft window is focused AND visible on screen.");
 	Log(L"[*] Clipping is currently: ENABLED");
 
 	// We'll pump messages only for hotkey; foreground tracking is via polling.
@@ -336,7 +416,8 @@ int wmain(int argc, wchar_t** argv)
 				lastActive = fg;
 			}
 
-			if (fg && IsMinecraftWindow(fg))
+			// Check if Minecraft is foreground AND actually visible
+			if (fg && IsMinecraftWindow(fg) && IsWindowActuallyVisibleAndTopmost(fg))
 			{
 				RECT clip{};
 				if (GetWindowClipRect(fg, clip))
@@ -356,6 +437,7 @@ int wmain(int argc, wchar_t** argv)
 				{
 					ClipCursor(nullptr);
 					lastClipped = false;
+					Log(L"[-] Minecraft not visible — cursor released.");
 				}
 			}
 		}
