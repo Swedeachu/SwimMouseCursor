@@ -129,6 +129,9 @@
   <ItemGroup>
     <ClCompile Include="SwimMouseCursor.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="VirtualKeyParser.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

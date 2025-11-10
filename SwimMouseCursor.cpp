@@ -20,6 +20,8 @@
 
 #pragma comment(lib, "Shlwapi.lib")
 
+#include "VirtualKeyParser.h"
+
 static const wchar_t* TARGET_EXE = L"Minecraft.Windows.exe";
 static const wchar_t* CONFIG_FILE = L"config.txt";
 static std::atomic<bool> clippingEnabled{ true };
@@ -235,29 +237,26 @@ static WORD LoadRecenterKeyFromConfig()
 	while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front())))
 		line.erase(0, 1);
 
-	// Validate: should be a single character
+	// Validate: should not be empty
 	if (line.empty())
 	{
 		Log(L"[!] Config file is empty. Defaulting to 'E'.");
 		return 'E';
 	}
 
-	if (line.length() > 1)
-	{
-		Log(L"[!] Config file contains multiple characters ('%S'). Using first character only.", line.c_str());
-	}
+	// Use the VirtualKeyParser to parse the key name
+	WORD parsedKey = VirtualKeyParser::ParseKeyName(line);
 
-	char keyChar = std::toupper(static_cast<unsigned char>(line[0]));
-
-	// Validate it's a letter or number (virtual key compatible)
-	if ((keyChar >= 'A' && keyChar <= 'Z') || (keyChar >= '0' && keyChar <= '9'))
+	if (parsedKey != 0)
 	{
-		Log(L"[*] Loaded recenter key from config: '%c'", keyChar);
-		return static_cast<WORD>(keyChar);
+		std::string keyName = VirtualKeyParser::GetKeyNameFromVK(parsedKey);
+		Log(L"[*] Loaded recenter key from config: '%S' (VK: 0x%02X)", keyName.c_str(), parsedKey);
+		return parsedKey;
 	}
 	else
 	{
-		Log(L"[!] Invalid character in config ('%c'). Must be A-Z or 0-9. Defaulting to 'E'.", keyChar);
+		Log(L"[!] Invalid key name in config ('%S'). Defaulting to 'E'.", line.c_str());
+		Log(L"[!] Valid examples: E, TAB, VK_TAB, SPACE, F1, CTRL, etc.");
 		return 'E';
 	}
 }
@@ -336,7 +335,8 @@ int wmain(int argc, wchar_t** argv)
 	}
 	else
 	{
-		Log(L"[*] Recenter hotkey ready: Press '%c' to recenter cursor (non-blocking).", (char)recenterKey);
+		std::string keyName = VirtualKeyParser::GetKeyNameFromVK(recenterKey);
+		Log(L"[*] Recenter hotkey ready: Press '%S' to recenter cursor (non-blocking).", keyName.c_str());
 	}
 
 	Log(L"[*] CursorClipperConsole running. Looking for: %s", TARGET_EXE);
