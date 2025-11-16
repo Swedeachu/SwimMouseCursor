@@ -26,6 +26,7 @@ static const wchar_t* TARGET_EXE = L"Minecraft.Windows.exe";
 static const wchar_t* CONFIG_FILE = L"config.txt";
 static std::atomic<bool> clippingEnabled{ true };
 static std::atomic<bool> running{ true };
+static std::atomic<bool> windowBeingMoved{ false };
 static WORD recenterKey = 'E'; // Default recenter key
 static HHOOK keyboardHook = nullptr;
 
@@ -87,6 +88,42 @@ static bool IsMinecraftWindow(HWND hwnd)
 	return wcsstr(title, L"Minecraft") != nullptr;
 }
 
+// Detect if any window is being moved or resized
+static bool IsAnyWindowBeingMovedOrResized()
+{
+	// Check if left mouse button is down (used for dragging)
+	if (GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+	{
+		// Get cursor position
+		POINT pt;
+		if (GetCursorPos(&pt))
+		{
+			HWND hwndAtCursor = WindowFromPoint(pt);
+			if (hwndAtCursor)
+			{
+				// Check if cursor is over a window's non-client area (title bar, borders)
+				LRESULT hitTest = SendMessageW(hwndAtCursor, WM_NCHITTEST, 0, MAKELPARAM(pt.x, pt.y));
+
+				// If hit test returns any of these, a move/resize is likely happening
+				if (hitTest == HTCAPTION ||      // Title bar (dragging to move)
+					hitTest == HTLEFT ||         // Left border
+					hitTest == HTRIGHT ||        // Right border
+					hitTest == HTTOP ||          // Top border
+					hitTest == HTTOPLEFT ||      // Top-left corner
+					hitTest == HTTOPRIGHT ||     // Top-right corner
+					hitTest == HTBOTTOM ||       // Bottom border
+					hitTest == HTBOTTOMLEFT ||   // Bottom-left corner
+					hitTest == HTBOTTOMRIGHT)    // Bottom-right corner
+				{
+					return true;
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
 static bool IsWindowActuallyVisibleAndTopmost(HWND hwnd)
 {
 	if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd))
@@ -126,14 +163,32 @@ static bool IsWindowActuallyVisibleAndTopmost(HWND hwnd)
 		}
 	}
 
+	// More aggressive check - sample the CENTER of the window
+	// If the center point doesn't belong to Minecraft, another window is definitely on top
+	int centerX = (windowRect.left + windowRect.right) / 2;
+	int centerY = (windowRect.top + windowRect.bottom) / 2;
+	POINT centerPt = { centerX, centerY };
+
+	HWND windowAtCenter = WindowFromPoint(centerPt);
+	if (windowAtCenter)
+	{
+		HWND rootAtCenter = GetAncestor(windowAtCenter, GA_ROOT);
+		HWND rootMinecraft = GetAncestor(hwnd, GA_ROOT);
+
+		// If center doesn't belong to Minecraft, we're definitely covered
+		if (rootAtCenter != rootMinecraft)
+			return false;
+	}
+
 	// Sample multiple points across the window to ensure it's actually visible
 	// This catches cases where another window is layered on top
 	int numChecks = 0;
 	int passedChecks = 0;
 
-	for (int x = windowRect.left + 10; x < windowRect.right - 10; x += (windowRect.right - windowRect.left) / 4)
+	// More aggressive sampling - check more points
+	for (int x = windowRect.left + 10; x < windowRect.right - 10; x += (windowRect.right - windowRect.left) / 5)
 	{
-		for (int y = windowRect.top + 10; y < windowRect.bottom - 10; y += (windowRect.bottom - windowRect.top) / 4)
+		for (int y = windowRect.top + 10; y < windowRect.bottom - 10; y += (windowRect.bottom - windowRect.top) / 5)
 		{
 			numChecks++;
 			POINT pt = { x, y };
@@ -150,8 +205,8 @@ static bool IsWindowActuallyVisibleAndTopmost(HWND hwnd)
 		}
 	}
 
-	// At least 75% of sampled points must belong to Minecraft
-	if (numChecks > 0 && passedChecks < (numChecks * 3 / 4))
+	// STRICTER: Require 90% of sampled points to belong to Minecraft (was 75%)
+	if (numChecks > 0 && passedChecks < (numChecks * 9 / 10))
 		return false;
 
 	// Final check: Verify no other window has captured input
@@ -171,29 +226,95 @@ static bool GetWindowClipRect(HWND hwnd, RECT& outClipRect)
 {
 	if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) return false;
 
+	// Force a brief wait to ensure window has settled after focus change
+	// This helps ensure GetWindowRect returns accurate dimensions. This is incredibly scuffed and C style hacky but works.
+	// I am scared a high level sleep call might hurt/delay chained input across the windows messaging pipeline and program functionality on certain CPUs.
+	// Sleep(5); // Just not going to do it then.
+
+	// ALWAYS get fresh window rect - don't trust cached values
 	RECT wr{};
 	if (!GetWindowRect(hwnd, &wr)) return false;
 
-	// Clip to the window's client area for better experience
-	RECT clientRect{};
-	if (GetClientRect(hwnd, &clientRect))
-	{
-		POINT topLeft = { clientRect.left, clientRect.top };
-		POINT bottomRight = { clientRect.right, clientRect.bottom };
+	// Validate window rect is reasonable
+	if (wr.right <= wr.left || wr.bottom <= wr.top)
+		return false;
 
-		// Convert client coordinates to screen coordinates
+	// Get fresh client rect
+	RECT clientRect{};
+	if (!GetClientRect(hwnd, &clientRect))
+	{
+		// If client rect fails, use window rect as fallback
+		outClipRect = wr;
+		return true;
+	}
+
+	// Validate client rect
+	if (clientRect.right <= 0 || clientRect.bottom <= 0)
+	{
+		// Invalid client rect, use window rect
+		outClipRect = wr;
+		return true;
+	}
+
+	// Create points for client area corners
+	POINT topLeft = { 0, 0 };
+	POINT bottomRight = { clientRect.right, clientRect.bottom };
+
+	// CRITICAL: Always get fresh screen coordinates
+	// Try multiple times to ensure we get valid coordinates
+	bool convertSuccess = false;
+	for (int attempt = 0; attempt < 3; attempt++)
+	{
 		if (ClientToScreen(hwnd, &topLeft) && ClientToScreen(hwnd, &bottomRight))
 		{
-			outClipRect.left = topLeft.x;
-			outClipRect.top = topLeft.y;
-			outClipRect.right = bottomRight.x;
-			outClipRect.bottom = bottomRight.y;
-			return true;
+			// Validate the converted coordinates make sense
+			if (bottomRight.x > topLeft.x && bottomRight.y > topLeft.y)
+			{
+				convertSuccess = true;
+				break;
+			}
+		}
+
+		// If conversion failed, wait briefly and try again, in testing this seems unreachable though (which is good).
+		if (attempt < 2)
+		{
+			Sleep(5);
+			// Reset points
+			topLeft = { 0, 0 };
+			bottomRight = { clientRect.right, clientRect.bottom };
 		}
 	}
 
-	// Fallback to window rect if client rect fails
-	outClipRect = wr;
+	if (!convertSuccess)
+	{
+		// If all conversion attempts failed, use window rect
+		outClipRect = wr;
+		return true;
+	}
+
+	// Double-check that client area is actually within window rect
+	// This catches weird edge cases
+	if (topLeft.x < wr.left - 10 || topLeft.y < wr.top - 10 ||
+		bottomRight.x > wr.right + 10 || bottomRight.y > wr.bottom + 10)
+	{
+		// Client area seems wrong, use window rect
+		outClipRect = wr;
+		return true;
+	}
+
+	// Use the client area (excludes title bar and borders)
+	outClipRect.left = topLeft.x;
+	outClipRect.top = topLeft.y;
+	outClipRect.right = bottomRight.x;
+	outClipRect.bottom = bottomRight.y;
+
+	// Final sanity check on output rect
+	if (outClipRect.right <= outClipRect.left || outClipRect.bottom <= outClipRect.top)
+	{
+		// Something went wrong, use window rect
+		outClipRect = wr;
+	}
+
 	return true;
 }
 
@@ -309,8 +430,8 @@ int wmain(int argc, wchar_t** argv)
 {
 	SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
-	Log(L"Swim Mouse Cursor, a Program to fix Minecraft Bedrock 1.21.121's Mouse Cursor Window Issues");
-	Log(L"By Swedeachu/Swimfan72: discord.gg/swim");
+	Log(L"Bedrock Mouse Cursor, a Program to fix Minecraft Bedrock 1.21.121's Mouse Cursor Window Issues");
+	Log(L"Programmed by Swedeachu, sponsored by discord.gg/swim");
 	Log(L"Play Our MCPE Server: swimgg.club");
 	Log(L"\n");
 
@@ -347,6 +468,7 @@ int wmain(int argc, wchar_t** argv)
 	MSG msg{};
 	HWND lastActive = nullptr;
 	bool lastClipped = false;
+	bool needsClipUpdate = false;
 
 	auto lastPoll = GetTickCount();
 	const DWORD POLL_MS = 10;
@@ -383,6 +505,36 @@ int wmain(int argc, wchar_t** argv)
 		{
 			lastPoll = now;
 
+			// Check if any window is being moved or resized
+			bool movingWindow = IsAnyWindowBeingMovedOrResized();
+			if (movingWindow != windowBeingMoved.load())
+			{
+				windowBeingMoved.store(movingWindow);
+				if (movingWindow)
+				{
+					Log(L"[~] Window move/resize detected — temporarily releasing cursor.");
+					ClipCursor(nullptr);
+					lastClipped = false;
+				}
+				else
+				{
+					Log(L"[~] Window move/resize ended — forcing clip rect update.");
+					needsClipUpdate = true; // Force update clip rect after window change
+				}
+			}
+
+			// If a window is being moved/resized, don't clip
+			if (movingWindow)
+			{
+				if (lastClipped)
+				{
+					ClipCursor(nullptr);
+					lastClipped = false;
+				}
+				std::this_thread::yield();
+				continue;
+			}
+
 			HWND fg = GetForegroundWindow();
 
 			// If clipping is disabled, always release
@@ -393,16 +545,17 @@ int wmain(int argc, wchar_t** argv)
 					ClipCursor(nullptr);
 					lastClipped = false;
 				}
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				std::this_thread::yield();
 				continue;
 			}
 
 			if (fg != lastActive)
 			{
-				// Foreground changed
+				// Foreground changed - FORCE clip rect refresh
 				if (fg && IsMinecraftWindow(fg))
 				{
-					Log(L"[+] Minecraft active.");
+					Log(L"[+] Minecraft active - refreshing window geometry.");
+					needsClipUpdate = true; // Force fresh clip rect calculation
 				}
 				else
 				{
@@ -420,15 +573,47 @@ int wmain(int argc, wchar_t** argv)
 			if (fg && IsMinecraftWindow(fg) && IsWindowActuallyVisibleAndTopmost(fg))
 			{
 				RECT clip{};
+				// ALWAYS get fresh clip rect - never trust old values
 				if (GetWindowClipRect(fg, clip))
 				{
-					if (!lastClipped)
+					// Validate clip rect is reasonable
+					if (clip.right > clip.left && clip.bottom > clip.top)
 					{
-						Log(L"[#] Clipping cursor to Minecraft window (%ld,%ld)-(%ld,%ld).",
-							clip.left, clip.top, clip.right, clip.bottom);
+						// Check if clip rect actually changed significantly (moved/resized)
+						RECT currentClip{};
+						bool hasCurrentClip = (GetClipCursor(&currentClip) != 0);
+
+						bool clipChanged = !hasCurrentClip ||
+							abs(currentClip.left - clip.left) > 2 ||
+							abs(currentClip.top - clip.top) > 2 ||
+							abs(currentClip.right - clip.right) > 2 ||
+							abs(currentClip.bottom - clip.bottom) > 2;
+
+						// Log and update if this is first clip, forced update, or rect changed
+						if (needsClipUpdate || !lastClipped || clipChanged)
+						{
+							Log(L"[#] Clipping cursor to Minecraft window (%ld,%ld)-(%ld,%ld).",
+								clip.left, clip.top, clip.right, clip.bottom);
+							ClipCursor(&clip);
+							lastClipped = true;
+							needsClipUpdate = false;
+						}
+						else
+						{
+							// Rect is the same, but still apply it to ensure consistency
+							ClipCursor(&clip);
+						}
 					}
-					ClipCursor(&clip);
-					lastClipped = true;
+					else
+					{
+						// Invalid clip rect
+						if (lastClipped)
+						{
+							ClipCursor(nullptr);
+							lastClipped = false;
+							Log(L"[-] Invalid clip rect — cursor released.");
+						}
+					}
 				}
 			}
 			else
@@ -443,7 +628,7 @@ int wmain(int argc, wchar_t** argv)
 		}
 
 		// Be a good citizen
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		std::this_thread::yield();
 	}
 
 	// Cleanup
