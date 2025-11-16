@@ -163,14 +163,32 @@ static bool IsWindowActuallyVisibleAndTopmost(HWND hwnd)
 		}
 	}
 
+	// More aggressive check - sample the CENTER of the window
+	// If the center point doesn't belong to Minecraft, another window is definitely on top
+	int centerX = (windowRect.left + windowRect.right) / 2;
+	int centerY = (windowRect.top + windowRect.bottom) / 2;
+	POINT centerPt = { centerX, centerY };
+
+	HWND windowAtCenter = WindowFromPoint(centerPt);
+	if (windowAtCenter)
+	{
+		HWND rootAtCenter = GetAncestor(windowAtCenter, GA_ROOT);
+		HWND rootMinecraft = GetAncestor(hwnd, GA_ROOT);
+
+		// If center doesn't belong to Minecraft, we're definitely covered
+		if (rootAtCenter != rootMinecraft)
+			return false;
+	}
+
 	// Sample multiple points across the window to ensure it's actually visible
 	// This catches cases where another window is layered on top
 	int numChecks = 0;
 	int passedChecks = 0;
 
-	for (int x = windowRect.left + 10; x < windowRect.right - 10; x += (windowRect.right - windowRect.left) / 4)
+	// More aggressive sampling - check more points
+	for (int x = windowRect.left + 10; x < windowRect.right - 10; x += (windowRect.right - windowRect.left) / 5)
 	{
-		for (int y = windowRect.top + 10; y < windowRect.bottom - 10; y += (windowRect.bottom - windowRect.top) / 4)
+		for (int y = windowRect.top + 10; y < windowRect.bottom - 10; y += (windowRect.bottom - windowRect.top) / 5)
 		{
 			numChecks++;
 			POINT pt = { x, y };
@@ -187,8 +205,8 @@ static bool IsWindowActuallyVisibleAndTopmost(HWND hwnd)
 		}
 	}
 
-	// At least 75% of sampled points must belong to Minecraft
-	if (numChecks > 0 && passedChecks < (numChecks * 3 / 4))
+	// STRICTER: Require 90% of sampled points to belong to Minecraft (was 75%)
+	if (numChecks > 0 && passedChecks < (numChecks * 9 / 10))
 		return false;
 
 	// Final check: Verify no other window has captured input
